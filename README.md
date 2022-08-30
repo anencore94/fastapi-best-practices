@@ -104,6 +104,7 @@ fastapi-project
    3. `models.py` - for db models
    4. `service.py` - module specific business logic  
    5. `dependencies.py` - router dependencies
+        1. dependency injector 로 사용될 함수들을 모아두어서 해당 도메인 내에서 재사용하기 쉽도록 한다.
    6. `constants.py` - module specific constants and error codes
    7. `config.py` - e.g. env vars
    8. `utils.py` - non-business logic functions, e.g. response normalization, data enrichment, etc.
@@ -173,7 +174,9 @@ async def get_post_reviews(post: Mapping = Depends(valid_post_id)):
     return post_reviews
 ```
 If we didn't put data validation to dependency, we would have to add post_id validation
-for every endpoint and write the same tests for each of them. 
+for every endpoint and write the same tests for each of them.
+  - **Dependency injection 에 넣지 않으면 모든 endpoint 에서 비슷한 로직을 수행해야 함**
+  - 하지만 이걸 수행하기 위해서는 동일한 request 에서는 동일한 세션임을 보장할 수 있어야 동시성 문제를 해결할 수 있지 않을까?
 
 ### 4. Chain dependencies
 Dependencies can use other dependencies and avoid code repetition for similar logic.
@@ -218,6 +221,8 @@ async def get_user_post(post: Mapping = Depends(valid_owned_post)):
 
 ```
 ### 5. Decouple & Reuse dependencies. Dependency calls are cached.
+- 캐시라는 단어에 오해하지 말 것. 이 캐시의 lifecycle 은 동일한 request context 내에서 존재하고, 따라서 `Depends` 의 `use_cache` argument 는 동일한 request 내에서 여러 번 call 될 경우에만 활용된다. 즉, sub-dependency 를 사용하지 않는 대부분의 경우에는 고려하지 않아도 된다.
+
 Dependencies can be reused multiple times, and they won't be recalculated - FastAPI caches dependency's result within a request's scope by default,
 i.e. if we have a dependency that calls service `get_post_by_id`, we won't be visiting DB each time we call this dependency - only the first function call.
 
@@ -340,7 +345,8 @@ Use /me endpoints for users own resources (e.g. `GET /profiles/me`, `GET /users/
 Under the hood, FastAPI can [effectively handle](https://fastapi.tiangolo.com/async/#path-operation-functions) both async and sync I/O operations. 
 - FastAPI runs `sync` routes in the [threadpool](https://en.wikipedia.org/wiki/Thread_pool) 
 and blocking I/O operations won't stop the [event loop](https://docs.python.org/3/library/asyncio-eventloop.html) 
-from executing the tasks. 
+from executing the tasks.
+    - coroutine 이 아닌 일반 method 는 다른 스레드에서 돌림 (path operation function 이나 dependency 로 선언된 경우, 그렇지 않은 다른 method 들은 일반적인 sync/async method 실행 방식과 동일하게 실행됨)
 - Otherwise, if the route is defined `async` then it's called regularly via `await` 
 and FastAPI trusts you to do only non-blocking I/O operations.
 
@@ -375,9 +381,10 @@ async def perfect_ping():
 **What happens when we call:**
 1. `GET /terrible-ping`
    1. FastAPI server receives a request and starts handling it 
-   2. Server's event loop and all the tasks in the queue will be waiting until `time.sleep()` is finished
+   2. **Server's event loop and all the tasks in the queue will be waiting until `time.sleep()` is finished**
       1. Server thinks `time.sleep()` is not an I/O task, so it waits until it is finished
       2. Server won't accept any new requests while waiting
+      3. **따라서 절대로 blocking call 은 coroutine 으로 선언된 path operation method 내에서 수행하지 않아야 한다.**
    3. Then, event loop and all the tasks in the queue will be waiting until `service.get_pong` is finished
       1. Server thinks `service.get_pong()` is not an I/O task, so it waits until it is finished
       2. Server won't accept any new requests while waiting
@@ -389,6 +396,7 @@ async def perfect_ping():
    3. While `good_ping` is being executed, event loop selects next tasks from the queue and works on them (e.g. accept new request, call db)
       - Independently of main thread (i.e. our FastAPI app), 
         worker thread will be waiting for `time.sleep` to finish and then for `service.get_pong` to finish
+      - **메인 스레드에는 영향 0**
    4. When `good_ping` finishes its work, server returns a response to the client
 3. `GET /perfect-ping`
    1. FastAPI server receives a request and starts handling it
@@ -397,6 +405,8 @@ async def perfect_ping():
    4. When `asyncio.sleep(10)` is done, servers goes to the next lines and awaits `service.async_get_pong`
    5. Event loop selects next tasks from the queue and works on them (e.g. accept new request, call db)
    6. When `service.async_get_pong` is done, server returns a response to the client
+
+**계속해서 염두에 두어야 하는 내용 :**
 
 The second caveat is that operations that are non-blocking awaitables or are sent to thread pool must be I/O intensive tasks (e.g. open file, db call, external API call).
 - Awaiting CPU-intensive tasks (e.g. heavy calculations, data processing, video transcoding) is worthless since the CPU has to work to finish the tasks, 
